@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fork snapshot — 2026-10-03
+
++ [新增] Added ordered OpenAI-compatible image providers with model aliases, asynchronous polling, fallback routing, keep-forever image tasks, automatic retry targets, and provider test coverage.
++ [新增] Added grid and per-reference workflows: screenshot grid detection, crop ranges, cell previews, Ctrl/⌘ multi-select, compressed-image tolerance, face-aware preselection, per-reference roles/context, optional prompts, and send-count previews.
++ [新增] Added named reference sets with partial selection, browser-local image history, image-manager prompt lookup, faster gallery loading, and automatic resume after temporary account recovery.
++ [新增] Added account cooldown handling, atomic JSON saves, download retries, English refusal handling, and retention cleanup controls.
++ [新增] Added Chinese Traditional UI support and locale switching for the web application.
++ [新增] Added CPA account-source mode: remote credential synchronization, OAuth ownership in the CPA service, refresh and delete operations, quota-unknown handling, token rotation, and a configurable image-account allowlist.
++ [新增] Added the prompt library page and `/api/prompts`, preserving successful task prompts and linking prompt entries back to image generation.
++ [新增] Added public documentation, sanitized configuration examples, security/privacy guidance, and an offline unit-test runner for this standalone fork.
+
 ## 1.9.3 - 2026-09-20
 
 + [优化] 移除标注编辑区域的明暗双色斜纹，减少对原图内容的视觉干扰。
