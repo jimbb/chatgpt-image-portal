@@ -1,0 +1,2494 @@
+"use client";
+
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ArrowDown, History, LoaderCircle, Plus, Trash2 } from "lucide-react";
+import { toast } from "sonner";
+
+import { ImageComposer, type ReferenceMode, type RetrySettings } from "@/app/image/components/image-composer";
+import {
+  checkGridImage,
+  cropGridCell,
+  detectGrid,
+  detectGridLayout,
+  formatGridCells,
+  gridCheckRequest,
+  parseGridCell,
+  parseGridCells,
+  resolveGridLayout,
+  screenshotGrid,
+  type GridCheck,
+  type GridSize,
+} from "@/lib/grid-detect";
+import { ImageDrawingDialog } from "@/app/image/components/image-drawing-dialog";
+import { ImageResults, type ImageLightboxItem } from "@/app/image/components/image-results";
+import { ImageSidebar } from "@/app/image/components/image-sidebar";
+import { ImageLightbox } from "@/components/image-lightbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
+import {
+  createImageEditTask,
+  createImageGenerationTask,
+  detectGridFaces,
+  fetchAccounts,
+  fetchImageModelCatalog,
+  fetchImageTasks,
+  resumeImagePoll,
+  type Account,
+  type ImageModel,
+  type ImageTask,
+} from "@/lib/api";
+import { clearCachedImages, deleteCachedImageSources, resolveCachedImage } from "@/lib/image-cache";
+import { currentLocale } from "@/lib/locale";
+import { useAuthGuard } from "@/lib/use-auth-guard";
+import { useSettingsStore } from "@/app/settings/store";
+import {
+  clearImageConversations,
+  deleteImageConversation,
+  getImageConversationStats,
+  listImageConversations,
+  renameImageConversation,
+  saveImageConversation,
+  saveImageConversations,
+  sortImageConversations,
+  type ImageConversation,
+  type ImageConversationMode,
+  type ImageTurn,
+  type ImageTurnStatus,
+  type StoredImage,
+  type StoredReferenceImage,
+} from "@/store/image-conversations";
+
+const ACTIVE_CONVERSATION_STORAGE_KEY = "chatgpt2api:image_active_conversation_id";
+const IMAGE_RATIO_STORAGE_KEY = "chatgpt2api:image_last_ratio";
+const IMAGE_TIER_STORAGE_KEY = "chatgpt2api:image_last_tier";
+const IMAGE_QUALITY_STORAGE_KEY = "chatgpt2api:image_last_quality";
+const IMAGE_MODEL_STORAGE_KEY = "chatgpt2api:image_last_model";
+const IMAGE_COUNT_STORAGE_KEY = "chatgpt2api:image_last_count";
+const GRID_FACES_STORAGE_KEY = "chatgpt2api:grid_preselect_faces";
+// used only if the server's template can't be loaded; the real one is Settings → 网格拆分提示词模板
+const FALLBACK_GRID_PROMPT_TEMPLATE =
+  "Image 1 is a small, cropped thumbnail from a photo album. Restore it as the complete original photo at full resolution, keeping the same subject, pose, outfit, background, composition and colours.";
+// Grid mode sends each cell cut out of the screenshot. When the cells can't be located (rows/cols typed
+// by hand) it sends the whole screenshot instead, with this prompt.
+const WHOLE_SCREENSHOT_GRID_PROMPT_TEMPLATE =
+  "Generate {cell} only: the photo in row {row}, column {col} (counted from the top-left; a row cut off at the top or bottom edge still counts) of this {rows}x{cols} photo grid. Output it as one complete, standalone full-resolution photo; if that cell is cut off, reconstruct the whole photo. Leave out the other cells, borders, timestamps and any app interface.";
+// 逐张参考 with 参考 photos (context) besides the 主图: added to every image's prompt
+const PER_REFERENCE_CONTEXT_PROMPT =
+  "Image 1 is the photo to work from: keep its pose, framing, scene and composition. The other images are reference photos of the same subject; use them to keep the face, hair and outfit consistent.";
+// grid mode with reference photos: added to every cell's prompt
+const GRID_REFERENCE_PHOTOS_PROMPT =
+  "The images after the first are reference photos of the same subject. Use them for accurate details (face, hair, outfit, items), but keep the pose, framing, background and colours of the first image.";
+const SCROLL_POSITIONS_STORAGE_KEY = "chatgpt2api:image_scroll_positions";
+const SCROLL_TO_LATEST_THRESHOLD = 160;
+const FALLBACK_IMAGE_MODELS: ImageModel[] = [
+  "gpt-image-2.5-sunburst",
+  "gpt-image-2.5-flare",
+  "gpt-image-2",
+  "gpt-5-5-thinking",
+  "gpt-5-5",
+  "gpt-5-3",
+];
+
+function loadScrollPositions(): Map<string, number> {
+  if (typeof window === "undefined") return new Map();
+  try {
+    const raw = window.sessionStorage.getItem(SCROLL_POSITIONS_STORAGE_KEY);
+    if (!raw) return new Map();
+    const parsed = JSON.parse(raw) as Record<string, number>;
+    return new Map(Object.entries(parsed));
+  } catch {
+    return new Map();
+  }
+}
+
+function saveScrollPositions(positions: Map<string, number>) {
+  if (typeof window === "undefined") return;
+  try {
+    const obj: Record<string, number> = {};
+    positions.forEach((value, key) => { obj[key] = value; });
+    window.sessionStorage.setItem(SCROLL_POSITIONS_STORAGE_KEY, JSON.stringify(obj));
+  } catch {
+    // sessionStorage may be full or unavailable
+  }
+}
+
+function fillGridTemplate(template: string, values: Record<string, string | number>) {
+  return template.replace(/\{(\w+)\}/g, (match, key: string) => (key in values ? String(values[key]) : match));
+}
+
+// Stored as the turn's prompt and the chat title, which show as user text (not converted), so it's
+// written in the UI's language; either spelling counts when recognising it later.
+const GRID_LABEL_NAMES = ["网格拆分", "網格拆分"];
+function gridLabel(grid: { rows: number; cols: number }, cells = "") {
+  return `${GRID_LABEL_NAMES[currentLocale() === "zh-TW" ? 1 : 0]} ${grid.rows}×${grid.cols}${cells ? ` ${cells}` : ""}`;
+}
+function isGridLabel(prompt: string, grid: { rows: number; cols: number }) {
+  return GRID_LABEL_NAMES.some((name) => prompt === `${name} ${grid.rows}×${grid.cols}` || prompt.startsWith(`${name} ${grid.rows}×${grid.cols} R`));
+}
+// 逐张参考 with 参考 photos sent without text: the turn's prompt and chat title (user text, not converted)
+const PER_REFERENCE_LABEL_WORDS = [["逐张参考", "主图", "参考"], ["逐張參考", "主圖", "參考"]];
+function perReferenceLabel(mains: number, references: number) {
+  const [name, main, reference] = PER_REFERENCE_LABEL_WORDS[currentLocale() === "zh-TW" ? 1 : 0];
+  return `${name} ${mains} ${main} + ${references} ${reference}`;
+}
+const isPerReferenceLabel = (prompt: string) => /^(逐张参考|逐張參考) \d+ (主图|主圖) \+ \d+ (参考|參考)$/.test(prompt);
+
+
+// Grid mode: `count` images per cell, each with its own cell prompt (+ the user's extra text). Ordered as
+// `count` full passes over the grid, so a whole set arrives first and the results lay out as complete grids.
+function createGridImages(
+  turnId: string, rows: number, cols: number, count: number, template: string, extraPrompt: string,
+  cells: number[] = Array.from({ length: rows * cols }, (_, index) => index), // 范围: the picked cells, reading order
+): StoredImage[] {
+  return Array.from({ length: cells.length * count }, (_, index) => {
+    const cellIndex = cells[index % cells.length];
+    const row = Math.floor(cellIndex / cols) + 1;
+    const col = (cellIndex % cols) + 1;
+    const cell = `R${row}C${col}`;
+    const id = `${turnId}-${index}`;
+    const cellPrompt = fillGridTemplate(template || FALLBACK_GRID_PROMPT_TEMPLATE, { cell, row, col, rows, cols });
+    return { id, taskId: id, status: "loading" as const, cell, prompt: extraPrompt ? `${cellPrompt}\n\n${extraPrompt}` : cellPrompt };
+  });
+}
+
+// One-per-reference mode: `count` images per 主图 (`mains`: their reference indexes), each sent with its 主图
+// first, then the 参考 photos if any (then `contextPrompt` is each image's prompt). With `pairs` (参考逐张搭配:
+// the 参考 photos' indexes) it's `count` images per 主图 × 参考 pair, each sent with just that one 参考.
+function createPerReferenceImages(turnId: string, mains: number[], count: number, contextPrompt = "", pairs: number[] = []): StoredImage[] {
+  const variants: Array<{ main: number; pair?: number }> = mains.flatMap((main) =>
+    pairs.length > 0 ? pairs.map((pair) => ({ main, pair })) : [{ main }],
+  );
+  return Array.from({ length: variants.length * count }, (_, index) => {
+    const id = `${turnId}-${index}`;
+    const { main, pair } = variants[Math.floor(index / count)];
+    return {
+      id,
+      taskId: id,
+      status: "loading" as const,
+      refIndex: main,
+      ...(pair != null ? { pairIndex: pair } : {}),
+      ...(contextPrompt ? { prompt: contextPrompt } : {}),
+    };
+  });
+}
+
+// Fresh loading copies that keep each image's variant (grid cell, reference, own prompt)
+function freshVariantImages(turnId: string, templates: StoredImage[]): StoredImage[] {
+  return templates.map((image, index) => {
+    const id = `${turnId}-${index}`;
+    return { id, taskId: id, status: "loading" as const, cell: image.cell, refIndex: image.refIndex, pairIndex: image.pairIndex, prompt: image.prompt };
+  });
+}
+
+function clampImageCount(value: string) {
+  return String(Math.min(100, Math.max(1, Math.floor(Number(value) || 1))));
+}
+function parseImageSize(size: string) {
+  const match = size.match(/^(\d+)x(\d+)$/);
+  return match ? { width: match[1], height: match[2] } : { width: "1024", height: "1024" };
+}
+
+const activeConversationQueueIds = new Set<string>();
+let pollAbortController: AbortController | null = null;
+
+function getResultsDistanceFromBottom(element: HTMLElement) {
+  return element.scrollHeight - element.scrollTop - element.clientHeight;
+}
+
+function buildConversationTitle(prompt: string) {
+  const trimmed = prompt.trim();
+  if (trimmed.length <= 12) {
+    return trimmed;
+  }
+  return `${trimmed.slice(0, 12)}...`;
+}
+
+function formatConversationTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function formatAvailableQuota(accounts: Account[]) {
+  const availableAccounts = accounts.filter((account) => account.status !== "禁用");
+  return String(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0));
+}
+
+function createId() {
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function readFileAsDataUrl(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("读取参考图失败"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function dataUrlToFile(dataUrl: string, fileName: string, mimeType?: string) {
+  const [header, content] = dataUrl.split(",", 2);
+  const matchedMimeType = header.match(/data:(.*?);base64/)?.[1];
+  const binary = atob(content || "");
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new File([bytes], fileName, { type: mimeType || matchedMimeType || "image/png" });
+}
+
+function normalizeStoredImageModel(value: string | null, availableModels: ImageModel[]): ImageModel {
+  const normalized = String(value || "").trim();
+  if (normalized && availableModels.includes(normalized)) {
+    return normalized;
+  }
+  return availableModels.includes("gpt-image-2") ? "gpt-image-2" : availableModels[0] || "gpt-image-2";
+}
+
+function buildReferenceImageFromResult(image: StoredImage, fileName: string): StoredReferenceImage | null {
+  if (!image.b64_json) {
+    return null;
+  }
+
+  return {
+    name: fileName,
+    type: "image/png",
+    dataUrl: `data:image/png;base64,${image.b64_json}`,
+  };
+}
+
+async function fetchImageAsFile(url: string, fileName: string) {
+  const blob = (await resolveCachedImage(url)).blob;
+  if (!blob) throw new Error("读取结果图失败");
+  return new File([blob], fileName, { type: blob.type || "image/png" });
+}
+
+function getTurnResultSources(turn: ImageTurn | null | undefined) {
+  return turn?.images.flatMap((image) => (image.url ? [image.url] : [])) || [];
+}
+
+function getConversationResultSources(conversation: ImageConversation | null | undefined) {
+  return conversation?.turns.flatMap(getTurnResultSources) || [];
+}
+
+async function buildReferenceImageFromStoredImage(image: StoredImage, fileName: string) {
+  const direct = buildReferenceImageFromResult(image, fileName);
+  if (direct) {
+    return {
+      referenceImage: direct,
+      file: dataUrlToFile(direct.dataUrl, direct.name, direct.type),
+    };
+  }
+
+  if (!image.url) {
+    return null;
+  }
+  const file = await fetchImageAsFile(image.url, fileName);
+  return {
+    referenceImage: {
+      name: file.name,
+      type: file.type || "image/png",
+      dataUrl: await readFileAsDataUrl(file),
+    },
+    file,
+  };
+}
+
+function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage {
+  if (task.status === "success") {
+    const first = task.data?.[0];
+    if (!first?.b64_json && !first?.url) {
+      return {
+        ...image,
+        taskId: task.id,
+        status: "error",
+        taskStatus: undefined,
+        progress: undefined,
+        error: "未返回图片数据",
+      };
+    }
+    return {
+      ...image,
+      taskId: task.id,
+      status: "success",
+      taskStatus: undefined,
+      progress: undefined,
+      b64_json: first.b64_json,
+      url: first.url,
+      revised_prompt: first.revised_prompt,
+      error: undefined,
+      durationMs: task.duration_ms,
+      ...(task.grid_check
+        ? { gridCheck: { mismatch: task.grid_check.mismatch, bestCell: task.grid_check.best_cell }, gridRedo: task.grid_check.redos }
+        : {}),
+    };
+  }
+
+  if (task.status === "error") {
+    return {
+      ...image,
+      taskId: task.id,
+      status: "error",
+      taskStatus: undefined,
+      progress: undefined,
+      error: task.error || "生成失败",
+      durationMs: task.duration_ms,
+    };
+  }
+
+  const newTaskStatus = task.status === "queued" ? "queued" : task.status === "running" ? "running" : image.taskStatus;
+  const shouldSetStartTime = newTaskStatus === "running" && !image.startTime;
+  const startTime = shouldSetStartTime ? Date.now() : image.startTime;
+  // elapsedSecs 仅使用后端返回的值，确保计时从 image_stream_resolve_start 开始
+  const elapsedSecs =
+    newTaskStatus === "running" && typeof task.elapsed_secs === "number"
+      ? task.elapsed_secs
+      : undefined;
+
+  return {
+    ...image,
+    taskId: task.id,
+    status: "loading",
+    taskStatus: newTaskStatus,
+    progress: task.progress || image.progress,
+    error: undefined,
+    startTime,
+    elapsedSecs,
+    elapsedUpdatedAt: elapsedSecs != null ? Date.now() : undefined,
+    attempts: task.attempts,
+  };
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function pickFallbackConversationId(conversations: ImageConversation[]) {
+  const activeConversation = conversations.find((conversation) =>
+    conversation.turns.some((turn) => turn.status === "queued" || turn.status === "generating"),
+  );
+  return activeConversation?.id ?? conversations[0]?.id ?? null;
+}
+
+function deriveTurnStatus(turn: ImageTurn): Pick<ImageTurn, "status" | "error"> {
+  const loadingCount = turn.images.filter((image) => image.status === "loading").length;
+  const failedCount = turn.images.filter((image) => image.status === "error").length;
+  const successCount = turn.images.filter((image) => image.status === "success").length;
+  if (loadingCount > 0) {
+    // 如果任何图片的 taskStatus 为 running，则状态为 generating
+    const hasRunning = turn.images.some((image) => image.taskStatus === "running");
+    if (hasRunning) {
+      return { status: "generating", error: undefined };
+    }
+    return { status: turn.status === "queued" ? "queued" : "generating", error: undefined };
+  }
+  if (failedCount > 0) {
+    return { status: "error", error: `其中 ${failedCount} 张未成功生成` };
+  }
+  if (successCount > 0) {
+    return { status: "success", error: undefined };
+  }
+  // 所有图片都被忽略（images 为空），视为完成
+  return { status: "success", error: undefined };
+}
+
+function finalizeIdleQueuedTurn(turn: ImageTurn): ImageTurn {
+  if (
+    (turn.status !== "queued" && turn.status !== "generating") ||
+    turn.images.some((image) => image.status === "loading")
+  ) {
+    return turn;
+  }
+  const derived = deriveTurnStatus(turn);
+  if (derived.status === turn.status && derived.error === turn.error) {
+    return turn;
+  }
+  return {
+    ...turn,
+    ...derived,
+  };
+}
+
+async function syncConversationImageTasks(items: ImageConversation[]) {
+  const taskIds = Array.from(
+    new Set(
+      items.flatMap((conversation) =>
+        conversation.turns.flatMap((turn) =>
+          turn.resultsDeleted
+            ? []
+            : turn.images.flatMap((image) =>
+                (image.status === "loading" || (image.status === "error" && image.taskId))
+                  ? [image.taskId!]
+                  : [],
+              ),
+        ),
+      ),
+    ),
+  );
+  if (taskIds.length === 0) {
+    return items;
+  }
+
+  let taskList: Awaited<ReturnType<typeof fetchImageTasks>>;
+  try {
+    taskList = await fetchImageTasks(taskIds);
+  } catch {
+    return items;
+  }
+  const taskMap = new Map(taskList.items.map((task) => [task.id, task]));
+  let changed = false;
+  const normalized = items.map((conversation) => {
+    const turns = conversation.turns.map((turn) => {
+      let turnChanged = false;
+      const images = turn.images.map((image) => {
+        if (!image.taskId) {
+          return image;
+        }
+        if (image.status !== "loading" && image.status !== "error") {
+          return image;
+        }
+        const task = taskMap.get(image.taskId);
+        if (!task) {
+          return image;
+        }
+        const nextImage = taskDataToStoredImage(image, task);
+        if (nextImage !== image) {
+          turnChanged = true;
+        }
+        return nextImage;
+      });
+      if (!turnChanged) {
+        return turn;
+      }
+      changed = true;
+      const derived = deriveTurnStatus({ ...turn, images });
+      return {
+        ...turn,
+        ...derived,
+        images,
+      };
+    });
+    if (turns === conversation.turns || !turns.some((turn, index) => turn !== conversation.turns[index])) {
+      return conversation;
+    }
+    return {
+      ...conversation,
+      turns,
+      updatedAt: new Date().toISOString(),
+    };
+  });
+
+  if (changed) {
+    await saveImageConversations(normalized);
+  }
+  return normalized;
+}
+
+async function recoverConversationHistory(items: ImageConversation[]) {
+  let changed = false;
+  const normalized = items.map((conversation) => {
+    const turns = conversation.turns.map((turn) => {
+      if (turn.status !== "queued" && turn.status !== "generating" && turn.status !== "error") {
+        return turn;
+      }
+
+      let turnChanged = false;
+      const images = turn.images.map((image) => {
+        if (image.status !== "loading" || image.taskId) {
+          return image;
+        }
+        turnChanged = true;
+        return {
+          ...image,
+          status: "error" as const,
+          error: "页面刷新或任务中断，未找到可恢复的任务 ID",
+        };
+      });
+      const candidateTurn = turnChanged ? { ...turn, images } : turn;
+      const nextTurn = finalizeIdleQueuedTurn(candidateTurn);
+      const derived = turnChanged ? deriveTurnStatus(nextTurn) : { status: nextTurn.status, error: nextTurn.error };
+      if (!turnChanged && nextTurn === turn && derived.status === turn.status && derived.error === turn.error) {
+        return turn;
+      }
+      changed = true;
+      return {
+        ...nextTurn,
+        ...derived,
+      };
+    });
+
+    if (!turns.some((turn, index) => turn !== conversation.turns[index])) {
+      return conversation;
+    }
+
+    return {
+      ...conversation,
+      turns,
+      updatedAt: new Date().toISOString(),
+    };
+  });
+
+  if (changed) {
+    await saveImageConversations(normalized);
+  }
+
+  return syncConversationImageTasks(normalized);
+}
+
+
+function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
+  const didLoadQuotaRef = useRef(false);
+  const conversationsRef = useRef<ImageConversation[]>([]);
+  const loadCancelledRef = useRef(false);
+  const resultsViewportRef = useRef<HTMLDivElement>(null);
+  const lastConversationIdRef = useRef<string | null>(null);
+  const shouldStickToBottomRef = useRef(true);
+  const scrollRafRef = useRef<number | null>(null);
+  const scrollSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const scrollPositionsRef = useRef<Map<string, number>>(loadScrollPositions());
+  const isRestoringScrollRef = useRef(false);
+  const scrollRestoreGenerationRef = useRef(0);
+  // image manager's 打开对话 link (/image/?conversation=…&image=…): the image to scroll to once it renders
+  const pendingJumpRef = useRef<{ conversationId: string; imageId: string } | null>(null);
+  const gridCheckingRef = useRef(new Set<string>()); // conversations whose grid images are being checked
+
+  const config = useSettingsStore((state) => state.config);
+  const imageTimeoutRetrySecs = Number(config?.image_timeout_retry_secs || 30);
+
+  const [imagePrompt, setImagePrompt] = useState("");
+  const [imageCount, setImageCount] = useState("3");
+  // composer toggle (default on): lets the server auto-retry this prompt's failures toward Settings' target %
+  const [draftRetry, setDraftRetry] = useState<RetrySettings>({ autoRetry: true, retryPercent: null }); // new chats
+  const [globalRetryPercent, setGlobalRetryPercent] = useState(0);
+  const [gridPromptTemplate, setGridPromptTemplate] = useState("");
+  // what to do with reference images: all in one job, split a grid screenshot, or one job per reference
+  const [referenceMode, setReferenceMode] = useState<ReferenceMode>("combined");
+  // 逐张参考 with 参考 photos: all of them with each 主图 (false), or each 主图 × each 参考 separately (true)
+  const [pairReferences, setPairReferences] = useState(false);
+  const [gridRows, setGridRows] = useState("");
+  const [gridCols, setGridCols] = useState("");
+  // grid mode's 范围 (e.g. R4C1 to R4C3); blank = the grid's first / last cell
+  const [gridCells, setGridCells] = useState(""); // 范围: picked cells, e.g. "R1C2, R3C1–R3C3"; blank = all
+  const [isDetectingGrid, setIsDetectingGrid] = useState(false);
+  // 只选有人脸的格子: a new screenshot starts with just the cells that show a face picked (off: every cell)
+  const [preselectFaces, setPreselectFaces] = useState(true);
+  const [isFindingFaces, setIsFindingFaces] = useState(false);
+  const faceRequestRef = useRef(0); // only the latest face lookup applies its picks
+  const [imageRatio, setImageRatio] = useState("auto");
+  const [imageTier, setImageTier] = useState("1k");
+  const [imageWidth, setImageWidth] = useState("1024");
+  const [imageHeight, setImageHeight] = useState("1024");
+  const [imageQuality, setImageQuality] = useState("auto");
+  const [imageModel, setImageModel] = useState<ImageModel>("gpt-image-2");
+  const [globalImageModel, setGlobalImageModel] = useState<ImageModel>("gpt-image-2");
+  const [imageModels, setImageModels] = useState<ImageModel[]>(FALLBACK_IMAGE_MODELS);
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  const [referenceImageFiles, setReferenceImageFiles] = useState<File[]>([]);
+  const [referenceImages, setReferenceImages] = useState<StoredReferenceImage[]>([]);
+  const [maskFiles, setMaskFiles] = useState<File[]>([]);
+  const [maskImages, setMaskImages] = useState<StoredReferenceImage[]>([]);
+  const [conversations, setConversations] = useState<ImageConversation[]>([]);
+  const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(true);
+  const [availableQuota, setAvailableQuota] = useState("加载中...");
+  const [lightboxImages, setLightboxImages] = useState<ImageLightboxItem[]>([]);
+  const [lightboxOpen, setLightboxOpen] = useState(false);
+  const [lightboxIndex, setLightboxIndex] = useState(0);
+  const [drawingDialog, setDrawingDialog] = useState<
+    | { mode: "sketch" }
+    | { mode: "annotate"; conversationId: string; image: StoredImage; source: string }
+    | null
+  >(null);
+  const scrollToLatestBtnRef = useRef<HTMLButtonElement>(null);
+  const [deleteConfirm, setDeleteConfirm] = useState<
+    | { type: "one"; id: string }
+    | { type: "prompt"; conversationId: string; turnId: string }
+    | { type: "results"; conversationId: string; turnId: string }
+    | { type: "all" }
+    | null
+  >(null);
+  const [timeoutRetry, setTimeoutRetry] = useState<{
+    conversationId: string;
+    taskId: string;
+    taskError: string;
+  } | null>(null);
+
+  const parsedCount = useMemo(() => Number(clampImageCount(imageCount)), [imageCount]);
+  const selectedConversation = useMemo(
+    () => conversations.find((item) => item.id === selectedConversationId) ?? null,
+    [conversations, selectedConversationId],
+  );
+  const activeTaskCount = useMemo(
+    () =>
+      conversations.reduce((sum, conversation) => {
+        const stats = getImageConversationStats(conversation);
+        return sum + stats.queued + stats.running;
+      }, 0),
+    [conversations],
+  );
+  const deleteConfirmTitle =
+    deleteConfirm?.type === "all"
+      ? "清空历史记录"
+      : deleteConfirm?.type === "prompt"
+        ? "删除提示词记录"
+        : deleteConfirm?.type === "results"
+          ? "删除生成结果"
+          : deleteConfirm?.type === "one"
+            ? "删除对话"
+            : "";
+  const deleteConfirmDescription =
+    deleteConfirm?.type === "all"
+      ? "确认删除全部图片历史记录吗？删除后无法恢复。"
+      : deleteConfirm?.type === "prompt"
+        ? "确认删除这条提示词记录吗？对应生成结果会保留。"
+        : deleteConfirm?.type === "results"
+          ? "确认删除这条生成结果吗？对应提示词记录会保留。"
+          : deleteConfirm?.type === "one"
+            ? "确认删除这条图片对话吗？删除后无法恢复。"
+            : "";
+
+  useEffect(() => {
+    conversationsRef.current = conversations;
+  }, [conversations]);
+
+  const scrollResultsToLatest = useCallback((behavior: ScrollBehavior = "smooth") => {
+    const element = resultsViewportRef.current;
+    if (!element) {
+      return;
+    }
+
+    shouldStickToBottomRef.current = true;
+    const btn = scrollToLatestBtnRef.current;
+    if (btn) btn.style.display = "none";
+    element.scrollTo({
+      top: element.scrollHeight,
+      behavior,
+    });
+  }, []);
+
+  const handleResultsScroll = useCallback(() => {
+    if (scrollRafRef.current !== null) {
+      return;
+    }
+
+    scrollRafRef.current = window.requestAnimationFrame(() => {
+      scrollRafRef.current = null;
+      const element = resultsViewportRef.current;
+      if (!element) {
+        return;
+      }
+
+      // 恢复滚动位置期间不处理滚动事件
+      if (isRestoringScrollRef.current) {
+        return;
+      }
+
+      // 保存当前会话的滚动位置（debounce 300ms 写入 sessionStorage）
+      const convId = lastConversationIdRef.current;
+      if (convId) {
+        scrollPositionsRef.current.set(convId, element.scrollTop);
+        if (scrollSaveTimerRef.current) clearTimeout(scrollSaveTimerRef.current);
+        scrollSaveTimerRef.current = setTimeout(() => {
+          scrollSaveTimerRef.current = null;
+          saveScrollPositions(scrollPositionsRef.current);
+        }, 300);
+      }
+
+      const isAwayFromLatest = getResultsDistanceFromBottom(element) > SCROLL_TO_LATEST_THRESHOLD;
+      shouldStickToBottomRef.current = !isAwayFromLatest;
+      // 直接操作 DOM 控制按钮显隐，避免 setState 触发全组件重渲染
+      const btn = scrollToLatestBtnRef.current;
+      if (btn) {
+        if (isAwayFromLatest) {
+          btn.style.display = "";
+        } else {
+          btn.style.display = "none";
+        }
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (scrollRafRef.current !== null) {
+        window.cancelAnimationFrame(scrollRafRef.current);
+      }
+      if (scrollSaveTimerRef.current !== null) {
+        clearTimeout(scrollSaveTimerRef.current);
+        saveScrollPositions(scrollPositionsRef.current);
+      }
+    };
+  }, []);
+
+  const loadHistory = useCallback(async () => {
+    try {
+      const storedRatio =
+        typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_RATIO_STORAGE_KEY) : null;
+      const storedTier =
+        typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_TIER_STORAGE_KEY) : null;
+      const storedQuality =
+        typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_QUALITY_STORAGE_KEY) : null;
+      const storedCount =
+        typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_COUNT_STORAGE_KEY) : null;
+      setImageRatio(storedRatio || "1:1");
+      setImageTier(storedTier || "1k");
+      setImageWidth("1024");
+      setImageHeight("1024");
+      setImageQuality(storedQuality || "auto");
+      setImageCount(storedCount ? clampImageCount(storedCount) : "1");
+      setPreselectFaces(typeof window === "undefined" || window.localStorage.getItem(GRID_FACES_STORAGE_KEY) !== "0");
+
+      const items = await listImageConversations();
+      const normalizedItems = await recoverConversationHistory(items);
+      if (loadCancelledRef.current) {
+        return;
+      }
+
+      conversationsRef.current = normalizedItems;
+      setConversations(normalizedItems);
+      const linkParams = new URLSearchParams(window.location.search);
+      const promptParam = linkParams.get("prompt");
+      if (promptParam) {
+        setImagePrompt(promptParam);
+        window.history.replaceState(null, "", window.location.pathname);
+      }
+      const linkedConversationId = linkParams.get("conversation");
+      if (linkedConversationId) {
+        window.history.replaceState(null, "", window.location.pathname); // a reload shouldn't jump again
+        if (normalizedItems.some((conversation) => conversation.id === linkedConversationId)) {
+          pendingJumpRef.current = { conversationId: linkedConversationId, imageId: linkParams.get("image") || "" };
+          scrollPositionsRef.current.delete(linkedConversationId);
+          shouldStickToBottomRef.current = false;
+        } else {
+          toast.error("找不到这张图片所在的对话，可能已被删除");
+        }
+      }
+      const storedConversationId =
+        pendingJumpRef.current?.conversationId ?? window.localStorage.getItem(ACTIVE_CONVERSATION_STORAGE_KEY);
+      const nextSelectedConversationId =
+        (storedConversationId && normalizedItems.some((conversation) => conversation.id === storedConversationId)
+          ? storedConversationId
+          : null) ?? pickFallbackConversationId(normalizedItems);
+      setSelectedConversationId(nextSelectedConversationId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "读取会话记录失败";
+      toast.error(message);
+    } finally {
+      if (!loadCancelledRef.current) {
+        setIsLoadingHistory(false);
+      }
+    }
+  }, [
+    setImageRatio,
+    setImageTier,
+    setImageWidth,
+    setImageHeight,
+    setImageQuality,
+    setImageCount,
+    setConversations,
+    setSelectedConversationId,
+    setIsLoadingHistory,
+  ]);
+
+  // Handle bfcache (back/forward cache) — re-sync task status on page restore
+  useEffect(() => {
+    const handlePageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) {
+        void loadHistory();
+      }
+    };
+    window.addEventListener("pageshow", handlePageShow);
+    return () => window.removeEventListener("pageshow", handlePageShow);
+  }, [loadHistory]);
+
+  useEffect(() => {
+    loadCancelledRef.current = false;
+    void loadHistory();
+    return () => {
+      loadCancelledRef.current = true;
+      // 组件卸载时保存当前滚动位置到 sessionStorage
+      const element = resultsViewportRef.current;
+      const convId = lastConversationIdRef.current;
+      if (element && convId) {
+        scrollPositionsRef.current.set(convId, element.scrollTop);
+        saveScrollPositions(scrollPositionsRef.current);
+      }
+      activeConversationQueueIds.clear();
+      if (pollAbortController) {
+        pollAbortController.abort();
+        pollAbortController = null;
+      }
+    };
+  }, [loadHistory]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadImageModels = async () => {
+      try {
+        const catalog = await fetchImageModelCatalog();
+        setGlobalRetryPercent(Number(catalog.retry_target_percent) || 0);
+        setGridPromptTemplate(catalog.grid_prompt_template || "");
+        const available = Array.from(new Set(catalog.models));
+        if (cancelled || available.length === 0) {
+          return;
+        }
+        setImageModels(available);
+        const storedModel = typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_MODEL_STORAGE_KEY) : null;
+        const configuredDefaultModel = String(catalog.default_image_model || "").trim();
+        if (configuredDefaultModel && available.includes(configuredDefaultModel)) {
+          setGlobalImageModel(configuredDefaultModel);
+        }
+        setImageModel((current) => {
+          if (configuredDefaultModel && available.includes(configuredDefaultModel)) {
+            return configuredDefaultModel;
+          }
+          if (available.includes(current)) {
+            return current;
+          }
+          return normalizeStoredImageModel(storedModel, available);
+        });
+      } catch {
+        if (!cancelled) {
+          setImageModels(FALLBACK_IMAGE_MODELS);
+        }
+      }
+    };
+
+    void loadImageModels();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const loadQuota = useCallback(async () => {
+    if (!isAdmin) {
+      setAvailableQuota("--");
+      return;
+    }
+    try {
+      const data = await fetchAccounts();
+      setAvailableQuota(formatAvailableQuota(data.items));
+    } catch {
+      setAvailableQuota((prev) => (prev === "加载中..." ? "--" : prev));
+    }
+  }, [isAdmin]);
+
+  useEffect(() => {
+    if (didLoadQuotaRef.current) {
+      return;
+    }
+    didLoadQuotaRef.current = true;
+
+    const handleFocus = () => {
+      void loadQuota();
+    };
+
+    void loadQuota();
+    window.addEventListener("focus", handleFocus);
+    return () => {
+      window.removeEventListener("focus", handleFocus);
+    };
+  }, [isAdmin, loadQuota]);
+
+  // 切换会话时保存旧会话滚动位置，并隐藏容器防止闪烁
+  useLayoutEffect(() => {
+    if (!selectedConversation) {
+      lastConversationIdRef.current = null;
+      shouldStickToBottomRef.current = true;
+      const btn = scrollToLatestBtnRef.current;
+      if (btn) btn.style.display = "none";
+      return;
+    }
+
+    const element = resultsViewportRef.current;
+    if (!element) {
+      return;
+    }
+
+    const didSwitchConversation = lastConversationIdRef.current !== selectedConversation.id;
+
+    if (didSwitchConversation) {
+      // 递增 generation，使之前未完成的 rAF 回调失效
+      scrollRestoreGenerationRef.current += 1;
+
+      // 先保存旧会话的滚动位置（lastConversationIdRef 还是旧值）
+      const oldConvId = lastConversationIdRef.current;
+      if (oldConvId) {
+        scrollPositionsRef.current.set(oldConvId, element.scrollTop);
+        saveScrollPositions(scrollPositionsRef.current);
+      }
+      // 更新为新会话 ID
+      lastConversationIdRef.current = selectedConversation.id;
+
+      // 如果有保存的滚动位置，隐藏容器防止用户看到 scrollTop=0 的内容
+      const savedScrollTop = scrollPositionsRef.current.get(selectedConversation.id);
+      if (savedScrollTop != null && savedScrollTop > 0) {
+        element.style.visibility = "hidden";
+        isRestoringScrollRef.current = true;
+      }
+    }
+  }, [selectedConversation?.id]);
+
+  // 恢复滚动位置或跟随最新内容
+  useEffect(() => {
+    if (!selectedConversation) {
+      return;
+    }
+
+    const element = resultsViewportRef.current;
+    if (!element) {
+      return;
+    }
+
+    const savedScrollTop = scrollPositionsRef.current.get(selectedConversation.id);
+
+    if (savedScrollTop != null && savedScrollTop > 0) {
+      // 捕获当前 generation，用于检测是否已被新的切换取代
+      const generation = scrollRestoreGenerationRef.current;
+      // 容器已在 useLayoutEffect 中设为 visibility:hidden，用户看不到滚动过程
+      requestAnimationFrame(() => {
+        // 如果 generation 已变，说明用户又切换了，放弃本次恢复
+        if (scrollRestoreGenerationRef.current !== generation) return;
+        element.scrollTop = savedScrollTop;
+        // 再等一帧确保 scrollTop 生效后再显示容器
+        requestAnimationFrame(() => {
+          // 再次检查 generation
+          if (scrollRestoreGenerationRef.current !== generation) return;
+          const isAwayFromLatest = getResultsDistanceFromBottom(element) > SCROLL_TO_LATEST_THRESHOLD;
+          shouldStickToBottomRef.current = !isAwayFromLatest;
+          const btn = scrollToLatestBtnRef.current;
+          if (btn) btn.style.display = isAwayFromLatest ? "" : "none";
+          // 显示容器 — 用户直接看到正确位置的内容
+          element.style.visibility = "";
+          isRestoringScrollRef.current = false;
+        });
+      });
+      // 恢复后清除保存的位置，下次内容更新时走正常的 shouldFollowLatest 逻辑
+      scrollPositionsRef.current.delete(selectedConversation.id);
+      return;
+    }
+
+    // 无保存位置，按正常逻辑处理
+    const shouldFollowLatest =
+      shouldStickToBottomRef.current ||
+      getResultsDistanceFromBottom(element) <= SCROLL_TO_LATEST_THRESHOLD;
+
+    if (shouldFollowLatest) {
+      requestAnimationFrame(() => scrollResultsToLatest("smooth"));
+      return;
+    }
+
+    const btn = scrollToLatestBtnRef.current;
+    if (btn) btn.style.display = "";
+  }, [selectedConversation?.id, selectedConversation?.updatedAt, selectedConversation?.turns.length, scrollResultsToLatest]);
+
+  useEffect(() => {
+    const jump = pendingJumpRef.current;
+    if (!jump || selectedConversation?.id !== jump.conversationId) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      pendingJumpRef.current = null;
+      const target = document.querySelector<HTMLElement>(`[data-image-id="${CSS.escape(jump.imageId)}"]`);
+      if (!target) {
+        return;
+      }
+      target.scrollIntoView({ block: "center" });
+      target.style.outline = "3px solid #f59e0b";
+      target.style.outlineOffset = "4px";
+      target.style.borderRadius = "12px";
+      window.setTimeout(() => {
+        target.style.outline = "";
+      }, 2500);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [selectedConversation?.id]);
+
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    if (selectedConversationId) {
+      window.localStorage.setItem(ACTIVE_CONVERSATION_STORAGE_KEY, selectedConversationId);
+    } else {
+      window.localStorage.removeItem(ACTIVE_CONVERSATION_STORAGE_KEY);
+    }
+  }, [selectedConversationId]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    window.localStorage.setItem(IMAGE_RATIO_STORAGE_KEY, imageRatio);
+    window.localStorage.setItem(IMAGE_TIER_STORAGE_KEY, imageTier);
+    window.localStorage.setItem(IMAGE_QUALITY_STORAGE_KEY, imageQuality);
+    window.localStorage.setItem(IMAGE_MODEL_STORAGE_KEY, imageModel);
+  }, [imageRatio, imageTier, imageQuality, imageModel]);
+
+  useEffect(() => {
+    if (typeof window !== "undefined" && parsedCount > 0) {
+      window.localStorage.setItem(IMAGE_COUNT_STORAGE_KEY, String(parsedCount));
+    }
+  }, [parsedCount]);
+
+  useEffect(() => {
+    if (selectedConversationId && !conversations.some((conversation) => conversation.id === selectedConversationId)) {
+      setSelectedConversationId(pickFallbackConversationId(conversations));
+    }
+  }, [conversations, selectedConversationId]);
+
+  const persistConversation = async (conversation: ImageConversation) => {
+    const nextConversations = sortImageConversations([
+      conversation,
+      ...conversationsRef.current.filter((item) => item.id !== conversation.id),
+    ]);
+    conversationsRef.current = nextConversations;
+    setConversations(nextConversations);
+    await saveImageConversation(conversation);
+  };
+
+  const updateConversation = useCallback(
+    async (
+      conversationId: string,
+      updater: (current: ImageConversation | null) => ImageConversation,
+      options: { persist?: boolean } = {},
+    ) => {
+      const current = conversationsRef.current.find((item) => item.id === conversationId) ?? null;
+      const nextConversation = updater(current);
+      const nextConversations = sortImageConversations([
+        nextConversation,
+        ...conversationsRef.current.filter((item) => item.id !== conversationId),
+      ]);
+      conversationsRef.current = nextConversations;
+      setConversations(nextConversations);
+      if (options.persist !== false) {
+        await saveImageConversation(nextConversation);
+      }
+    },
+    [],
+  );
+
+  // Grid check in the browser, for grid images the server didn't check (made before it did, or whole-
+  // screenshot grids): compares each with the screenshot's cells and stores the verdict on the image
+  useEffect(() => {
+    const conversationId = selectedConversation?.id;
+    if (!conversationId || gridCheckingRef.current.has(conversationId)) {
+      return;
+    }
+    const unchecked = () =>
+      conversationsRef.current
+        .find((conversation) => conversation.id === conversationId)
+        ?.turns.flatMap((turn) =>
+          turn.grid && turn.referenceImages[0]
+            ? turn.images
+                .filter((image) => image.status === "success" && image.cell && image.gridCheck === undefined)
+                .map((image) => ({ turn, image }))
+            : [],
+        )
+        .slice(0, 12) ?? []; // saved in small batches so the flags show up while the rest is checked
+    if (unchecked().length === 0) {
+      return;
+    }
+    gridCheckingRef.current.add(conversationId);
+    void (async () => {
+      try {
+        for (let batch = unchecked(); batch.length > 0; batch = unchecked()) {
+          const verdicts = new Map<string, GridCheck>();
+          for (const { turn, image } of batch) {
+            const source = image.b64_json ? `data:image/png;base64,${image.b64_json}` : image.url || "";
+            verdicts.set(
+              image.id,
+              await resolveCachedImage(source)
+                .then(({ src }) => checkGridImage(turn.id, turn.referenceImages[0].dataUrl, turn.grid!, image.cell!, src))
+                .catch(() => null),
+            );
+          }
+          if (!conversationsRef.current.some((conversation) => conversation.id === conversationId)) {
+            return; // deleted meanwhile
+          }
+
+          await updateConversation(conversationId, (current) => ({
+            ...current!,
+            turns: current!.turns.map((turn) => ({
+              ...turn,
+              images: turn.images.map((image) =>
+                verdicts.has(image.id) ? { ...image, gridCheck: verdicts.get(image.id) } : image,
+              ),
+            })),
+          }));
+        }
+      } finally {
+        gridCheckingRef.current.delete(conversationId);
+      }
+    })();
+  }, [selectedConversation, updateConversation]);
+
+  useEffect(() => {
+    if (!selectedConversationId) return;
+    const conversation = conversationsRef.current.find((item) => item.id === selectedConversationId);
+    const conversationModel = conversation && imageModels.includes(conversation.model)
+      ? conversation.model
+      : imageModels[0];
+    if (conversationModel) {
+      setImageModel(conversationModel);
+    }
+  }, [imageModels, selectedConversationId]);
+
+  const handleConversationModelChange = useCallback(
+    async (model: ImageModel) => {
+      setImageModel(model);
+      if (!selectedConversationId) return;
+      await updateConversation(selectedConversationId, (current) => {
+        if (!current) {
+          throw new Error("图片对话不存在");
+        }
+        return { ...current, model, updatedAt: new Date().toISOString() };
+      });
+    },
+    [selectedConversationId, updateConversation],
+  );
+
+  const clearComposerInputs = useCallback(() => {
+    setImagePrompt("");
+    setReferenceImageFiles([]);
+    setReferenceImages([]);
+    setMaskFiles([]);
+    setMaskImages([]);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }, []);
+
+  const resetComposer = useCallback(() => {
+    clearComposerInputs();
+  }, [clearComposerInputs]);
+
+  const handleCreateDraft = () => {
+    shouldStickToBottomRef.current = true;
+    const btn = scrollToLatestBtnRef.current;
+    if (btn) btn.style.display = "none";
+    setSelectedConversationId(null);
+    setImageModel(globalImageModel);
+    resetComposer();
+    textareaRef.current?.focus();
+  };
+
+  const handleDeleteConversation = async (id: string) => {
+    const removedConversation = conversations.find((item) => item.id === id);
+    const nextConversations = conversations.filter((item) => item.id !== id);
+    conversationsRef.current = nextConversations;
+    setConversations(nextConversations);
+    if (selectedConversationId === id) {
+      setSelectedConversationId(pickFallbackConversationId(nextConversations));
+      resetComposer();
+    }
+
+    try {
+      await deleteImageConversation(id);
+      await deleteCachedImageSources(getConversationResultSources(removedConversation));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "删除会话失败";
+      toast.error(message);
+      const items = await listImageConversations();
+      conversationsRef.current = items;
+      setConversations(items);
+    }
+  };
+
+  const handleDeleteTurnPart = async (conversationId: string, turnId: string, part: "prompt" | "results") => {
+    const conversation = conversationsRef.current.find((item) => item.id === conversationId);
+    if (!conversation) {
+      return;
+    }
+    const removedSources = part === "results"
+      ? getTurnResultSources(conversation.turns.find((turn) => turn.id === turnId))
+      : [];
+
+    const turns = conversation.turns
+      .map((turn) => {
+        if (turn.id !== turnId) {
+          return turn;
+        }
+        const images =
+          part === "results"
+            ? turn.images.map((image) => ({ id: image.id, status: "error" as const, error: "生成结果已删除" }))
+            : turn.images;
+        const derived =
+          part === "results"
+            ? deriveTurnStatus({
+                ...turn,
+                images,
+              })
+            : { status: turn.status, error: turn.error };
+        const nextTurn = {
+          ...turn,
+          prompt: part === "prompt" ? "" : turn.prompt,
+          promptDeleted: part === "prompt" ? true : turn.promptDeleted,
+          resultsDeleted: part === "results" ? true : turn.resultsDeleted,
+          ...derived,
+          images,
+        };
+        return nextTurn.promptDeleted && nextTurn.resultsDeleted ? null : nextTurn;
+      })
+      .filter((turn): turn is ImageTurn => Boolean(turn));
+
+    if (turns.length === 0) {
+      await handleDeleteConversation(conversationId);
+      return;
+    }
+
+    const nextConversation = {
+      ...conversation,
+      updatedAt: new Date().toISOString(),
+      turns,
+    };
+    await persistConversation(nextConversation);
+    if (removedSources.length > 0) {
+      await deleteCachedImageSources(removedSources);
+    }
+  };
+
+  const handleClearHistory = async () => {
+    try {
+      await clearImageConversations();
+      await clearCachedImages().catch(() => undefined);
+      conversationsRef.current = [];
+      setConversations([]);
+      setSelectedConversationId(null);
+      resetComposer();
+      toast.success("已清空历史记录");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "清空历史记录失败";
+      toast.error(message);
+    }
+  };
+
+  const handleRenameConversation = async (id: string, title: string) => {
+    const nextConversations = conversations.map((item) =>
+      item.id === id ? { ...item, title, updatedAt: new Date().toISOString() } : item,
+    );
+    conversationsRef.current = sortImageConversations(nextConversations);
+    setConversations(conversationsRef.current);
+    try {
+      await renameImageConversation(id, title);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "重命名失败";
+      toast.error(message);
+    }
+  };
+
+  const openDeleteConversationConfirm = (id: string) => {
+    setIsHistoryOpen(false);
+    setDeleteConfirm({ type: "one", id });
+  };
+
+  const openDeletePromptConfirm = (conversationId: string, turnId: string) => {
+    setDeleteConfirm({ type: "prompt", conversationId, turnId });
+  };
+
+  const openDeleteResultsConfirm = (conversationId: string, turnId: string) => {
+    setDeleteConfirm({ type: "results", conversationId, turnId });
+  };
+
+  const openClearHistoryConfirm = () => {
+    setIsHistoryOpen(false);
+    setDeleteConfirm({ type: "all" });
+  };
+
+  const handleConfirmDelete = async () => {
+    const target = deleteConfirm;
+    setDeleteConfirm(null);
+    if (!target) {
+      return;
+    }
+    if (target.type === "all") {
+      await handleClearHistory();
+      return;
+    }
+    if (target.type === "prompt" || target.type === "results") {
+      await handleDeleteTurnPart(target.conversationId, target.turnId, target.type);
+      return;
+    }
+    await handleDeleteConversation(target.id);
+  };
+
+  const appendReferenceImages = useCallback(async (files: File[]) => {
+    if (files.length === 0) {
+      return;
+    }
+
+    try {
+      const previews = await Promise.all(
+        files.map(async (file) => ({
+          name: file.name,
+          type: file.type || "image/png",
+          dataUrl: await readFileAsDataUrl(file),
+        })),
+      );
+
+      setReferenceImageFiles((prev) => [...prev, ...files]);
+      setReferenceImages((prev) => [...prev, ...previews]);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+      return previews;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "读取参考图失败";
+      toast.error(message);
+    }
+  }, []);
+
+  const handleRemoveReferenceImage = useCallback((index: number) => {
+    setReferenceImageFiles((prev) => {
+      const next = prev.filter((_, currentIndex) => currentIndex !== index);
+      if (next.length === 0 && fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+      return next;
+    });
+    setReferenceImages((prev) => prev.filter((_, currentIndex) => currentIndex !== index));
+    setMaskFiles([]);
+    setMaskImages([]);
+  }, []);
+
+  const handleContinueEdit = useCallback(
+    async (conversationId: string, image: StoredImage | StoredReferenceImage) => {
+      try {
+        const nextReference =
+          "dataUrl" in image
+            ? {
+                referenceImage: image,
+                file: dataUrlToFile(image.dataUrl, image.name, image.type),
+              }
+            : await buildReferenceImageFromStoredImage(image, `conversation-${conversationId}-${Date.now()}.png`);
+        if (!nextReference) {
+          return;
+        }
+
+        setSelectedConversationId(conversationId);
+
+        setReferenceImages((prev) => [...prev, nextReference.referenceImage]);
+        setReferenceImageFiles((prev) => [...prev, nextReference.file]);
+        setMaskFiles([]);
+        setMaskImages([]);
+        setImagePrompt("");
+        textareaRef.current?.focus();
+        toast.success("已加入当前参考图，继续输入描述即可编辑");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "读取结果图失败";
+        toast.error(message);
+      }
+    },
+    [],
+  );
+
+  const handleAnnotateImage = useCallback(
+    (conversationId: string, image: StoredImage, source: string) => {
+      setDrawingDialog({ mode: "annotate", conversationId, image, source });
+    },
+    [],
+  );
+
+  const handleApplyDrawing = useCallback(
+    async (file: File) => {
+      if (!drawingDialog) return;
+      const dataUrl = await readFileAsDataUrl(file);
+      const storedDrawing: StoredReferenceImage = { name: file.name, type: file.type || "image/png", dataUrl };
+
+      if (drawingDialog.mode === "sketch") {
+        setReferenceImageFiles((current) => [...current, file]);
+        setReferenceImages((current) => [...current, storedDrawing]);
+        setImagePrompt("");
+        textareaRef.current?.focus();
+        toast.success("草图已加入参考图，请描述希望生成的完整画面");
+        return;
+      }
+
+      const source = await buildReferenceImageFromStoredImage(
+        drawingDialog.image,
+        `annotated-source-${Date.now()}.png`,
+      );
+      if (!source) {
+        throw new Error("无法读取要标注编辑的图片");
+      }
+      setSelectedConversationId(drawingDialog.conversationId);
+      setReferenceImageFiles([source.file]);
+      setReferenceImages([source.referenceImage]);
+      setMaskFiles([file]);
+      setMaskImages([storedDrawing]);
+      setImagePrompt("");
+      textareaRef.current?.focus();
+      toast.success("标注区域已应用，请描述需要如何修改");
+    },
+    [drawingDialog],
+  );
+
+  const handleReuseTurnConfig = useCallback(async (conversationId: string, turnId: string) => {
+    const conversation = conversationsRef.current.find((item) => item.id === conversationId);
+    const turn = conversation?.turns.find((item) => item.id === turnId);
+    if (!conversation || !turn || !turn.prompt.trim()) {
+      return;
+    }
+
+    setSelectedConversationId(conversationId);
+    setImagePrompt(
+      (turn.grid && isGridLabel(turn.prompt, turn.grid)) || (turn.perReference && isPerReferenceLabel(turn.prompt)) ? "" : turn.prompt,
+    );
+    setReferenceMode(turn.grid ? "grid" : turn.perReference ? "perReference" : "combined");
+    setPairReferences(turn.images.some((image) => image.pairIndex != null));
+    if (turn.grid) {
+      setGridRows(String(turn.grid.rows));
+      setGridCols(String(turn.grid.cols));
+      const cells = [...new Set(turn.images.map((image) => image.cell).filter(Boolean))];
+      const whole = cells.length === turn.grid.rows * turn.grid.cols;
+      const picked = cells.flatMap((cell) => {
+        const index = cell ? parseGridCell(cell, turn.grid!) : null;
+        return index === null ? [] : [index];
+      });
+      setGridCells(whole ? "" : formatGridCells(picked, turn.grid));
+    }
+    // grid / one-per-reference turns store the total; the composer's 张数 is per cell / per reference
+    const variants = turn.grid
+      ? new Set(turn.images.map((image) => image.cell)).size
+      : turn.perReference ? turn.referenceImages.length : 1;
+    setImageCount(String(Math.max(1, Math.round((turn.count || turn.images.length || 1) / Math.max(1, variants)))));
+    setImageRatio(turn.ratio);
+    setImageTier(turn.tier);
+    const parsedSize = parseImageSize(turn.size);
+    setImageWidth(parsedSize.width);
+    setImageHeight(parsedSize.height);
+    setImageQuality(turn.quality);
+    setImageModel(turn.model);
+    setReferenceImages(turn.referenceImages);
+    setMaskImages(turn.maskImages);
+    setReferenceImageFiles(
+      turn.referenceImages.map((image) => dataUrlToFile(image.dataUrl, image.name, image.type)),
+    );
+    setMaskFiles(turn.maskImages.map((image) => dataUrlToFile(image.dataUrl, image.name, image.type)));
+    await updateConversation(conversationId, (current) => ({
+      ...(current ?? conversation),
+      model: turn.model,
+      updatedAt: new Date().toISOString(),
+    }));
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+    textareaRef.current?.focus();
+    toast.success("已复用这条提示词配置");
+  }, [updateConversation]);
+
+  const openLightbox = useCallback((images: ImageLightboxItem[], index: number) => {
+    if (images.length === 0) {
+      return;
+    }
+
+    setLightboxImages(images);
+    setLightboxIndex(Math.max(0, Math.min(index, images.length - 1)));
+    setLightboxOpen(true);
+  }, []);
+
+  const createLoadingImages = (turnId: string, count: number) =>
+    Array.from({ length: count }, (_, index) => {
+      const imageId = `${turnId}-${index}`;
+      return {
+        id: imageId,
+        taskId: imageId,
+        status: "loading" as const,
+      };
+    });
+
+  /* eslint-disable react-hooks/preserve-manual-memoization */
+  const runConversationQueue = useCallback(
+    async (conversationId: string) => {
+      if (activeConversationQueueIds.has(conversationId)) {
+        return;
+      }
+
+      const snapshot = conversationsRef.current.find((conversation) => conversation.id === conversationId);
+      const activeTurn = snapshot?.turns.find(
+        (turn) =>
+          (turn.status === "queued" || turn.status === "generating") &&
+          turn.images.some((image) => image.status === "loading"),
+      );
+      if (!snapshot || !activeTurn) {
+        return;
+      }
+
+      activeConversationQueueIds.add(conversationId);
+      // Runs on every 2s poll. Only a real status change may bump updatedAt (the sidebar sorts by it) and
+      // rewrite stored history; elapsed-time ticks stay in memory. Bumping every tick made the sidebar reshuffle.
+      const applyTasks = async (tasks: ImageTask[]) => {
+        const taskMap = new Map(tasks.map((task) => [task.id, task]));
+        let changed = false;
+        await updateConversation(
+          conversationId,
+          (current) => {
+            const conversation = current ?? snapshot;
+            const turns = conversation.turns.map((turn) => {
+              if (turn.id !== activeTurn.id) {
+                return turn;
+              }
+              const images = turn.images.map((image) => {
+                const taskId = image.taskId || image.id;
+                const task = taskMap.get(taskId);
+                if (!task) {
+                  return image;
+                }
+                const next = taskDataToStoredImage({ ...image, taskId }, task);
+                changed ||= next.status !== image.status || next.taskStatus !== image.taskStatus;
+                return next;
+              });
+              const derived = deriveTurnStatus({ ...turn, images });
+              return {
+                ...turn,
+                ...derived,
+                images,
+              };
+            });
+            return {
+              ...conversation,
+              updatedAt: changed ? new Date().toISOString() : conversation.updatedAt,
+              turns,
+            };
+          },
+          { persist: false },
+        );
+        const latest = conversationsRef.current.find((item) => item.id === conversationId);
+        if (changed && latest) {
+          await saveImageConversation(latest);
+        }
+      };
+
+      try {
+
+        const referenceFiles = activeTurn.referenceImages.map((image, index) =>
+          dataUrlToFile(image.dataUrl, image.name || `${activeTurn.id}-${index + 1}.png`, image.type),
+        );
+        const activeMaskFiles = activeTurn.maskImages.map((image, index) =>
+          dataUrlToFile(image.dataUrl, image.name || `${activeTurn.id}-mask-${index + 1}.png`, image.type),
+        );
+        if (activeTurn.mode === "edit" && referenceFiles.length === 0) {
+          throw new Error("未找到可用于继续编辑的参考图");
+        }
+        // lets the server auto-retry failures until this prompt's images reach Settings' target %
+        const batch =
+          activeTurn.autoRetry === false
+            ? undefined
+            : { id: activeTurn.id, size: activeTurn.images.length, targetPercent: activeTurn.retryPercent ?? null };
+        // grid cells carry their own prompt and send their crop of the screenshot (+ the reference photos);
+        // one-per-reference images carry which reference to send
+        const promptFor = (image: StoredImage) => image.prompt || activeTurn.prompt;
+        const filesFor = async (image: StoredImage) => {
+          const crop =
+            activeTurn.grid?.crop && image.cell
+              ? await cropGridCell(activeTurn.id, activeTurn.referenceImages[0].dataUrl, activeTurn.grid, image.cell)
+              : null;
+          if (crop) {
+            return [crop, ...referenceFiles.slice(1)];
+          }
+          if (image.refIndex != null && referenceFiles[image.refIndex]) {
+            // 逐张参考: its 主图 first, then its one paired 参考 (参考逐张搭配) or every photo marked 参考
+            // (参考一起), never the other 主图
+            const context =
+              image.pairIndex != null
+                ? referenceFiles.filter((_, index) => index === image.pairIndex)
+                : referenceFiles.filter((_, index) => activeTurn.referenceImages[index]?.context && index !== image.refIndex);
+            return [referenceFiles[image.refIndex], ...context];
+          }
+          return referenceFiles;
+        };
+        const gridCheckFor = (image: StoredImage) =>
+          activeTurn.grid?.crop && image.cell
+            ? gridCheckRequest(activeTurn.id, activeTurn.referenceImages[0].dataUrl, activeTurn.grid, image.cell)
+            : null;
+        const masksFor = (image: StoredImage) => (image.refIndex != null ? [] : activeMaskFiles);
+
+        const pendingImages = activeTurn.images.filter((image) => image.status === "loading");
+        const submitted = await Promise.all(
+          pendingImages.map(async (image) => {
+            const taskId = image.taskId || image.id;
+            return activeTurn.mode === "edit"
+              ? createImageEditTask(taskId, await filesFor(image), promptFor(image), activeTurn.model, activeTurn.size, activeTurn.quality, masksFor(image), batch, await gridCheckFor(image))
+              : createImageGenerationTask(taskId, promptFor(image), activeTurn.model, activeTurn.size, activeTurn.quality, batch);
+          }),
+        );
+        await applyTasks(submitted);
+
+        let consecutiveErrors = 0;
+        const retryingTaskIdsRef = new Set<string>();
+        while (true) {
+          const latestConversation = conversationsRef.current.find((conversation) => conversation.id === conversationId);
+          const latestTurn = latestConversation?.turns.find((turn) => turn.id === activeTurn.id);
+          const loadingTaskIds =
+            latestTurn?.images.flatMap((image) =>
+              image.status === "loading" && image.taskId ? [image.taskId] : [],
+            ) || [];
+          if (loadingTaskIds.length === 0) {
+            break;
+          }
+
+          await sleep(2000);
+          try {
+            const taskList = await fetchImageTasks(loadingTaskIds);
+            consecutiveErrors = 0;
+            if (taskList.items.length > 0) {
+              // 检测是否有超时错误且需要显示重试按钮
+              const timeoutTask = taskList.items.find(
+                (task) =>
+                  task.status === "error" &&
+                  task.error?.includes("超时") &&
+                  task.conversation_id &&
+                  !retryingTaskIdsRef.has(task.id),
+              );
+              if (timeoutTask && timeoutTask.conversation_id) {
+                retryingTaskIdsRef.add(timeoutTask.id);
+                setTimeoutRetry({
+                  conversationId: timeoutTask.conversation_id,
+                  taskId: timeoutTask.id,
+                  taskError: timeoutTask.error || "生图超时",
+                });
+                // 应用超时错误到对应图片，显示继续等待按钮
+                await applyTasks([timeoutTask]);
+              } else {
+                await applyTasks(taskList.items);
+              }
+            }
+            if (taskList.missing_ids.length > 0 && latestTurn) {
+              const missingImages = latestTurn.images.filter(
+                (image) => image.status === "loading" && image.taskId && taskList.missing_ids.includes(image.taskId),
+              );
+              const resubmitted = await Promise.all(
+                missingImages.map(async (image) =>
+                  activeTurn.mode === "edit"
+                    ? createImageEditTask(image.taskId || image.id, await filesFor(image), promptFor(image), activeTurn.model, activeTurn.size, activeTurn.quality, masksFor(image), batch, await gridCheckFor(image))
+                    : createImageGenerationTask(image.taskId || image.id, promptFor(image), activeTurn.model, activeTurn.size, activeTurn.quality, batch),
+                ),
+              );
+              if (resubmitted.length > 0) {
+                await applyTasks(resubmitted);
+              }
+            }
+          } catch (pollError) {
+            consecutiveErrors += 1;
+            if (consecutiveErrors >= 10) {
+              throw pollError;
+            }
+          }
+        }
+
+        await loadQuota();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "生成图片失败";
+        await updateConversation(conversationId, (current) => {
+          const conversation = current ?? snapshot;
+          return {
+            ...conversation,
+            updatedAt: new Date().toISOString(),
+            turns: conversation.turns.map((turn) =>
+              turn.id === activeTurn.id
+                ? {
+                    ...turn,
+                    status: "error",
+                    error: message,
+                    images: turn.images.map((image) =>
+                      image.status === "loading" ? { ...image, status: "error", error: message } : image,
+                    ),
+                  }
+                : turn,
+            ),
+          };
+        });
+        toast.error(message);
+      } finally {
+        activeConversationQueueIds.delete(conversationId);
+        for (const conversation of conversationsRef.current) {
+          if (
+            !activeConversationQueueIds.has(conversation.id) &&
+            conversation.turns.some(
+              (turn) =>
+                (turn.status === "queued" || turn.status === "generating") &&
+                turn.images.some((image) => image.status === "loading"),
+            )
+          ) {
+            void runConversationQueue(conversation.id);
+          }
+        }
+      }
+    },
+    [loadQuota, updateConversation],
+  );
+  /* eslint-enable react-hooks/preserve-manual-memoization */
+
+  // Timed-out images can come back by themselves: when a blocked ChatGPT account recovers, the server fetches
+  // them like 继续等待. Checking this chat's timed-out images once a minute shows them without a click.
+  useEffect(() => {
+    const conversationId = selectedConversation?.id;
+    if (!conversationId) {
+      return;
+    }
+    const timer = window.setInterval(async () => {
+      const conversation = conversationsRef.current.find((item) => item.id === conversationId);
+      const timedOut = (conversation?.turns ?? []).flatMap((turn) =>
+        turn.images.flatMap((image) => (image.status === "error" && image.taskId && /超[时時]/.test(image.error || "") ? [image.taskId] : [])),
+      );
+      if (timedOut.length === 0) {
+        return;
+      }
+      const { items } = await fetchImageTasks(timedOut).catch(() => ({ items: [] as ImageTask[] }));
+      const revived = new Map(items.filter((task) => task.status !== "error").map((task) => [task.id, task]));
+      if (revived.size === 0) {
+        return;
+      }
+      await updateConversation(conversationId, (current) => ({
+        ...current!,
+        turns: current!.turns.map((turn) => {
+          if (!turn.images.some((image) => image.taskId && revived.has(image.taskId))) {
+            return turn;
+          }
+          const images = turn.images.map((image) =>
+            image.taskId && revived.has(image.taskId) ? taskDataToStoredImage(image, revived.get(image.taskId)!) : image,
+          );
+          return { ...turn, ...deriveTurnStatus({ ...turn, images }), images };
+        }),
+      }));
+      void runConversationQueue(conversationId); // follows the ones still running to the end
+    }, 60_000);
+    return () => window.clearInterval(timer);
+  }, [selectedConversation?.id, updateConversation, runConversationQueue]);
+
+  const handleRegenerateTurn = useCallback(
+    async (conversationId: string, turnId: string) => {
+      const conversation = conversationsRef.current.find((item) => item.id === conversationId);
+      const sourceTurn = conversation?.turns.find((turn) => turn.id === turnId);
+      if (!conversation || !sourceTurn || !sourceTurn.prompt.trim()) {
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const nextTurnId = createId();
+      const count = Math.max(1, sourceTurn.count || sourceTurn.images.length || 1);
+      const nextTurn: ImageTurn = {
+        id: nextTurnId,
+        prompt: sourceTurn.prompt,
+        model: sourceTurn.model,
+        mode: sourceTurn.mode,
+        referenceImages: sourceTurn.referenceImages,
+        maskImages: sourceTurn.maskImages,
+        count,
+        size: sourceTurn.size,
+        ratio: sourceTurn.ratio,
+        tier: sourceTurn.tier,
+        quality: sourceTurn.quality,
+        autoRetry: sourceTurn.autoRetry,
+        retryPercent: sourceTurn.retryPercent,
+        grid: sourceTurn.grid,
+        perReference: sourceTurn.perReference,
+        images:
+          sourceTurn.grid || sourceTurn.perReference
+            ? freshVariantImages(nextTurnId, sourceTurn.images)
+            : createLoadingImages(nextTurnId, count),
+        createdAt: now,
+        status: "queued",
+      };
+      const nextConversation = {
+        ...conversation,
+        updatedAt: now,
+        turns: [...conversation.turns, nextTurn],
+      };
+
+      setSelectedConversationId(conversationId);
+      await persistConversation(nextConversation);
+      void runConversationQueue(conversationId);
+      toast.success("已加入重新生成队列");
+    },
+    [runConversationQueue],
+  );
+
+  // one image, or several (grid check: 重新生成不符的图片)
+  const handleRetryImage = useCallback(
+    async (conversationId: string, turnId: string, imageId: string | string[]) => {
+      const conversation = conversationsRef.current.find((item) => item.id === conversationId);
+      if (!conversation) {
+        return;
+      }
+      const imageIds = new Set([imageId].flat());
+      const replacedImages = conversation.turns
+        .find((turn) => turn.id === turnId)
+        ?.images.filter((image) => imageIds.has(image.id)) ?? [];
+
+      const now = new Date().toISOString();
+      const nextConversation = {
+        ...conversation,
+        updatedAt: now,
+        turns: conversation.turns.map((turn) => {
+          if (turn.id !== turnId) {
+            return turn;
+          }
+          if (!turn.prompt.trim()) {
+            return turn;
+          }
+
+          const images = turn.images.map((image) => {
+            if (!imageIds.has(image.id)) {
+              return image;
+            }
+            const retryImageId = `${turnId}-${createId()}`;
+            return {
+              id: retryImageId,
+              taskId: retryImageId,
+              status: "loading" as const,
+              cell: image.cell,
+              refIndex: image.refIndex,
+              pairIndex: image.pairIndex,
+              prompt: image.prompt,
+            };
+          });
+          const derived = deriveTurnStatus({ ...turn, status: "queued", images });
+          return {
+            ...turn,
+            ...derived,
+            images,
+          };
+        }),
+      };
+
+      setSelectedConversationId(conversationId);
+      await persistConversation(nextConversation);
+      await deleteCachedImageSources(replacedImages.map((image) => image.url));
+      void runConversationQueue(conversationId);
+    },
+    [runConversationQueue],
+  );
+
+  const handleTimeoutRetryContinue = useCallback(async () => {
+    if (!timeoutRetry) return;
+    const { conversationId, taskId } = timeoutRetry;
+    try {
+      await resumeImagePoll(taskId, imageTimeoutRetrySecs);
+      // 将对应图片的状态重置为 loading，并清除错误
+      void updateConversation(conversationId, (current) => {
+        const conversation = current ?? conversationsRef.current.find((c) => c.id === conversationId);
+        if (!conversation) return current!;
+        return {
+          ...conversation,
+          updatedAt: new Date().toISOString(),
+          turns: conversation.turns.map((turn) => {
+            const hasLoading = turn.images.some((image) => image.taskId === taskId);
+            if (!hasLoading) return turn;
+            return {
+              ...turn,
+              status: "generating" as const,
+              error: undefined,
+              images: turn.images.map((image) =>
+                image.taskId === taskId
+                  ? { ...image, status: "loading" as const, error: undefined, taskStatus: "running" as const, startTime: image.startTime || Date.now() }
+                  : image
+              ),
+            };
+          }),
+        };
+      });
+      // 清除重试状态
+      setTimeoutRetry(null);
+      toast.info(`已继续等待 ${imageTimeoutRetrySecs} 秒`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "续轮询失败";
+      toast.error(msg);
+      setTimeoutRetry(null);
+    }
+  }, [timeoutRetry, updateConversation, imageTimeoutRetrySecs]);
+
+  const handleTimeoutRetryCancel = useCallback(() => {
+    if (!timeoutRetry) return;
+    const { conversationId: convId, taskId, taskError } = timeoutRetry;
+    // 将超时错误应用到对应图片
+    void updateConversation(convId, (current) => {
+      const conversation = current ?? conversationsRef.current.find((c) => c.id === convId);
+      if (!conversation) return current!;
+      return {
+        ...conversation,
+        updatedAt: new Date().toISOString(),
+        turns: conversation.turns.map((turn) => {
+          const hasLoading = turn.images.some((image) => image.status === "loading" && image.taskId === taskId);
+          if (!hasLoading) return turn;
+          const images = turn.images.map((image) =>
+            image.taskId === taskId ? { ...image, status: "error" as const, error: taskError } : image,
+          );
+          const derived = deriveTurnStatus({ ...turn, images });
+          return {
+            ...turn,
+            ...derived,
+            images,
+          };
+        }),
+      };
+    });
+    setTimeoutRetry(null);
+    toast.error(taskError);
+  }, [timeoutRetry, updateConversation]);
+
+  const handleDismissErrors = useCallback(
+    async (conversationId: string, turnId: string) => {
+      await updateConversation(conversationId, (current) => {
+        const conversation = current ?? conversationsRef.current.find((c) => c.id === conversationId);
+        if (!conversation) return current!;
+        return {
+          ...conversation,
+          updatedAt: new Date().toISOString(),
+          turns: conversation.turns.map((turn) => {
+            if (turn.id !== turnId) return turn;
+            const successImages = turn.images.filter((image) => image.status !== "error");
+            const derived = deriveTurnStatus({ ...turn, images: successImages });
+            return {
+              ...turn,
+              ...derived,
+              count: successImages.length,
+              images: successImages,
+            };
+          }),
+        };
+      });
+    },
+    [updateConversation],
+  );
+
+  useEffect(() => {
+    for (const conversation of conversations) {
+      if (
+        !activeConversationQueueIds.has(conversation.id) &&
+        conversation.turns.some(
+          (turn) =>
+            !turn.resultsDeleted &&
+            (turn.status === "queued" || turn.status === "generating") &&
+            turn.images.some((image) => image.status === "loading"),
+        )
+      ) {
+        void runConversationQueue(conversation.id);
+      }
+    }
+  }, [conversations, runConversationQueue]);
+
+  // retry settings of the open chat, or of the next new chat
+  const retrySettings: RetrySettings = selectedConversation
+    ? { autoRetry: selectedConversation.autoRetry !== false, retryPercent: selectedConversation.retryPercent ?? null }
+    : draftRetry;
+
+  const handleRetryChange = (next: RetrySettings) => {
+    if (!selectedConversationId) {
+      setDraftRetry(next);
+      return;
+    }
+    void updateConversation(selectedConversationId, (current) => {
+      if (!current) {
+        throw new Error("图片对话不存在");
+      }
+      return { ...current, ...next };
+    });
+  };
+
+  const preselectFaceCells = async (dataUrl: string, grid: GridSize) => {
+    const request = ++faceRequestRef.current;
+    setGridCells("");
+    const layout = resolveGridLayout(await detectGridLayout(dataUrl).catch(() => null), grid);
+    if (!layout || request !== faceRequestRef.current) {
+      return;
+    }
+    const boxes: Record<string, number[]> = {};
+    layout.rowSpans.forEach((row, r) =>
+      layout.colSpans.forEach((col, c) => {
+        boxes[`R${r + 1}C${c + 1}`] = [col.start, row.start, col.end - col.start, row.end - row.start];
+      }),
+    );
+    setIsFindingFaces(true);
+    try {
+      const { cells } = await detectGridFaces(dataUrl, boxes);
+      if (request !== faceRequestRef.current) {
+        return;
+      }
+      const picked = cells.flatMap((cell) => {
+        const index = parseGridCell(cell, grid);
+        return index === null ? [] : [index];
+      });
+      // cells picked by hand meanwhile win
+      setGridCells((current) => (current === "" ? formatGridCells(picked, grid) : current));
+      if (picked.length > 0) {
+        toast.success(`已预选 ${picked.length} 格有人脸的照片`);
+      } else {
+        toast.info("没找到人脸，已选全部格子");
+      }
+    } catch {
+      if (request === faceRequestRef.current) {
+        toast.error("找人脸失败，已选全部格子");
+      }
+    } finally {
+      if (request === faceRequestRef.current) {
+        setIsFindingFaces(false);
+      }
+    }
+  };
+
+  const handlePreselectFacesChange = (on: boolean) => {
+    setPreselectFaces(on);
+    window.localStorage.setItem(GRID_FACES_STORAGE_KEY, on ? "1" : "0");
+    const grid = { rows: Math.floor(Number(gridRows)), cols: Math.floor(Number(gridCols)) };
+    if (!on) {
+      faceRequestRef.current += 1;
+      setIsFindingFaces(false);
+      setGridCells("");
+    } else if (referenceImages[0] && grid.rows > 0 && grid.cols > 0) {
+      void preselectFaceCells(referenceImages[0].dataUrl, grid);
+    }
+  };
+
+  const handleDetectGrid = async (dataUrl = referenceImages[0]?.dataUrl) => {
+    if (!dataUrl) {
+      return;
+    }
+    setIsDetectingGrid(true);
+    try {
+      const grid = await detectGrid(dataUrl);
+      if (grid) {
+        setGridRows(String(grid.rows));
+        setGridCols(String(grid.cols));
+        toast.success(`识别为 ${grid.rows} 行 × ${grid.cols} 列，请核对`);
+        if (preselectFaces) {
+          void preselectFaceCells(dataUrl, grid);
+        }
+      } else {
+        toast.error("没能识别出网格，请手动填写行数和列数");
+      }
+    } catch {
+      toast.error("读取参考图失败");
+    } finally {
+      setIsDetectingGrid(false);
+    }
+  };
+
+  const handleReferenceModeChange = (mode: ReferenceMode) => {
+    setReferenceMode(mode);
+    if (mode === "grid" && (!gridRows || !gridCols)) {
+      void handleDetectGrid();
+    }
+  };
+
+  // paste, drag-and-drop and the file picker all land here
+  const handleReferenceImageChange = async (files: File[]) => {
+    if (files.length === 0) {
+      return;
+    }
+    const hadReferences = referenceImages.length > 0;
+    const added = await appendReferenceImages(files);
+    // grid mode picked first: detect rows × cols as soon as the screenshot arrives
+    if (referenceMode === "grid" && !hadReferences && added?.length === 1) {
+      void handleDetectGrid(added[0].dataUrl);
+    }
+  };
+
+  const handleSubmit = async () => {
+    const prompt = imagePrompt.trim();
+    const referenceCount = referenceImageFiles.length;
+    const mode: ReferenceMode = referenceCount > 0 ? referenceMode : "combined";
+    const rows = Math.floor(Number(gridRows));
+    const cols = Math.floor(Number(gridCols));
+    if (mode === "grid") {
+      if (referenceCount < 1) {
+        toast.error("网格拆分需要 1 张网格截图（第 1 张参考图）");
+        return;
+      }
+      if (!(rows >= 1 && cols >= 1 && rows * cols >= 2 && rows * cols <= 100)) {
+        toast.error("请填写网格的行数和列数（共 2–100 格）");
+        return;
+      }
+      const selected = parseGridCells(gridCells, { rows, cols });
+      if (!selected) {
+        toast.error(`范围要写成像 R1C2, R3C1-R3C3，而且都在 ${rows}×${cols} 网格内`);
+        return;
+      }
+      const cellCount = selected.length || rows * cols;
+      if (cellCount * parsedCount > 1000) {
+        toast.error(`${cellCount} 格 × 每格 ${parsedCount} 张超过 1000 张，请减少每格张数或缩小范围`);
+        return;
+      }
+    } else if (!prompt && !(mode === "perReference" && referenceImages.some((image) => image.context))) {
+      // text is optional in 逐张参考 with 参考 photos (the added line says what to do), like a grid
+      toast.error("请输入提示词");
+      return;
+    }
+    // 逐张参考: one result (× 张数) per 主图; photos marked 参考 only go along with each of them
+    const mains = referenceImages.flatMap((image, index) => (image.context ? [] : [index]));
+    if (mode === "perReference" && (mains.length === 0 || referenceCount < 2)) {
+      toast.error("逐张参考需要至少 1 张主图，且总共至少 2 张图");
+      return;
+    }
+    const turnId = createId();
+    // cells found in the screenshot: each one is sent cropped; otherwise the whole screenshot goes along
+    const crop = mode === "grid" && (await screenshotGrid(turnId, referenceImages[0].dataUrl, { rows, cols })) !== null;
+    const grid = mode === "grid" ? { rows, cols, crop } : undefined;
+    if (grid && !crop) {
+      // no grid found in the screenshot at all: the whole-screenshot fallback picks wrong cells far more
+      // often, and nothing can check its results
+      toast.warning("没能在截图里找到网格，改为发送整张截图：容易生成错的格子，也无法自动核对。", { duration: 10000 });
+    }
+    const picked = grid ? parseGridCells(gridCells, grid)! : [];
+    const turnPrompt = grid
+      ? prompt || gridLabel(grid, formatGridCells(picked, grid))
+      : prompt || perReferenceLabel(mains.length, referenceCount - mains.length);
+    const gridTemplate =
+      (crop ? gridPromptTemplate || FALLBACK_GRID_PROMPT_TEMPLATE : WHOLE_SCREENSHOT_GRID_PROMPT_TEMPLATE) +
+      (referenceCount > 1 ? `\n\n${GRID_REFERENCE_PHOTOS_PROMPT}` : "");
+
+    const effectiveImageMode: ImageConversationMode = referenceCount > 0 ? "edit" : "generate";
+
+    const targetConversation = selectedConversationId
+      ? conversationsRef.current.find((conversation) => conversation.id === selectedConversationId) ?? null
+      : null;
+    const now = new Date().toISOString();
+    const conversationId = targetConversation?.id ?? createId();
+    const imageSize = `${imageWidth || 1024}x${imageHeight || 1024}`;
+    const withContext = mode === "perReference" && mains.length < referenceCount;
+    const pairs = withContext && pairReferences ? referenceImages.flatMap((image, index) => (image.context ? [index] : [])) : [];
+    const turnImages = grid
+      ? createGridImages(turnId, grid.rows, grid.cols, parsedCount, gridTemplate, prompt, picked.length ? picked : undefined)
+      : mode === "perReference"
+        ? createPerReferenceImages(
+            turnId,
+            mains,
+            parsedCount,
+            withContext ? (prompt ? `${prompt}\n\n${PER_REFERENCE_CONTEXT_PROMPT}` : PER_REFERENCE_CONTEXT_PROMPT) : "",
+            pairs,
+          )
+        : createLoadingImages(turnId, parsedCount);
+    const draftTurn: ImageTurn = {
+      id: turnId,
+      prompt: turnPrompt,
+      model: targetConversation?.model || imageModel,
+      mode: effectiveImageMode,
+      referenceImages: effectiveImageMode === "edit" ? referenceImages : [],
+      maskImages: effectiveImageMode === "edit" ? maskImages : [],
+      count: turnImages.length,
+      size: imageSize,
+      ratio: imageRatio,
+      tier: imageTier,
+      quality: imageQuality,
+      // grid mode keeps going until every cell exists
+      autoRetry: grid ? true : retrySettings.autoRetry,
+      retryPercent: grid ? 100 : retrySettings.retryPercent,
+      grid,
+      perReference: mode === "perReference",
+      images: turnImages,
+      createdAt: now,
+      status: "queued",
+    };
+
+    const baseConversation: ImageConversation = targetConversation
+      ? {
+          ...targetConversation,
+          model: targetConversation.model || imageModel,
+          updatedAt: now,
+          turns: [...targetConversation.turns, draftTurn],
+        }
+      : {
+          id: conversationId,
+          title: buildConversationTitle(turnPrompt),
+          model: imageModel,
+          createdAt: now,
+          updatedAt: now,
+          turns: [draftTurn],
+          ...draftRetry,
+      };
+
+    shouldStickToBottomRef.current = true;
+    const btn = scrollToLatestBtnRef.current;
+    if (btn) btn.style.display = "none";
+    setSelectedConversationId(conversationId);
+    clearComposerInputs();
+
+    await persistConversation(baseConversation);
+    void runConversationQueue(conversationId);
+
+    const targetStats = getImageConversationStats(baseConversation);
+    if (targetStats.running > 0 || targetStats.queued > 1) {
+      toast.success("已加入当前对话队列");
+    } else if (!targetConversation) {
+      toast.success("已创建新对话并开始处理");
+    } else {
+      toast.success("已发送到当前对话");
+    }
+  };
+
+  return (
+    <>
+      <section className="mx-auto grid h-[calc(100dvh-6.5rem)] min-h-0 w-full max-w-[1380px] grid-cols-1 gap-2 overflow-hidden px-0 pb-[calc(env(safe-area-inset-bottom)+0.5rem)] sm:h-[calc(100dvh-5.25rem)] sm:gap-3 sm:px-3 sm:pb-6 lg:grid-cols-[240px_minmax(0,1fr)]">
+        <div className="hidden h-full min-h-0 border-r border-stone-200/70 pr-3 lg:block">
+          <ImageSidebar
+            conversations={conversations}
+            isLoadingHistory={isLoadingHistory}
+            selectedConversationId={selectedConversationId}
+            onCreateDraft={handleCreateDraft}
+            onClearHistory={openClearHistoryConfirm}
+            onSelectConversation={setSelectedConversationId}
+            onDeleteConversation={openDeleteConversationConfirm}
+            onRenameConversation={handleRenameConversation}
+            formatConversationTime={formatConversationTime}
+          />
+        </div>
+
+        <Dialog open={isHistoryOpen} onOpenChange={setIsHistoryOpen}>
+          <DialogContent className="flex h-[min(82dvh,760px)] w-[92vw] max-w-[460px] flex-col overflow-hidden rounded-[32px] border-white/80 bg-white p-0 shadow-[0_32px_110px_-38px_rgba(15,23,42,0.45)] sm:rounded-[36px]">
+            <DialogHeader className="px-6 pt-7 pb-4 sm:px-8">
+              <DialogTitle className="flex items-center gap-2 text-xl font-bold tracking-tight">
+                <History className="size-5" />
+                历史记录
+              </DialogTitle>
+            </DialogHeader>
+            <div className="min-h-0 flex-1 overflow-y-auto px-5 pb-8 sm:px-8">
+              <ImageSidebar
+                conversations={conversations}
+                isLoadingHistory={isLoadingHistory}
+                selectedConversationId={selectedConversationId}
+                onCreateDraft={() => {
+                  handleCreateDraft();
+                  setIsHistoryOpen(false);
+                }}
+                onClearHistory={openClearHistoryConfirm}
+                onSelectConversation={(id) => {
+                  setSelectedConversationId(id);
+                  setIsHistoryOpen(false);
+                }}
+                onDeleteConversation={openDeleteConversationConfirm}
+                onRenameConversation={handleRenameConversation}
+                formatConversationTime={formatConversationTime}
+                hideActionButtons
+              />
+            </div>
+          </DialogContent>
+        </Dialog>
+
+        <div className="flex min-h-0 flex-col gap-2 sm:gap-4">
+          <div className="flex items-center justify-between gap-2 px-1 lg:hidden">
+            <Button
+              variant="outline"
+              className="h-10 flex-1 rounded-2xl border-stone-200 bg-white/90 text-stone-700 shadow-sm"
+              onClick={() => setIsHistoryOpen(true)}
+            >
+              <History className="mr-2 size-4" />
+              历史记录 ({conversations.length})
+            </Button>
+            <Button
+              className="h-10 rounded-2xl bg-stone-950 text-white shadow-sm"
+              onClick={handleCreateDraft}
+            >
+              <Plus className="size-4" />
+              新建
+            </Button>
+            <Button
+              variant="outline"
+              className="h-10 rounded-2xl border-stone-200 bg-white/85 px-3 text-stone-600 shadow-sm"
+              onClick={openClearHistoryConfirm}
+              disabled={conversations.length === 0}
+            >
+              <Trash2 className="size-4" />
+            </Button>
+          </div>
+
+          <div className="relative min-h-0 flex-1">
+            <div
+              ref={resultsViewportRef}
+              onScroll={handleResultsScroll}
+              className="hide-scrollbar h-full overscroll-contain overflow-y-auto px-1 py-2 sm:px-4 sm:py-4"
+              style={{ contain: "layout style paint" }}
+            >
+              <ImageResults
+                selectedConversation={selectedConversation}
+                onOpenLightbox={openLightbox}
+                onContinueEdit={handleContinueEdit}
+                onAnnotateImage={handleAnnotateImage}
+                onDeletePrompt={openDeletePromptConfirm}
+                onDeleteResults={openDeleteResultsConfirm}
+                onReuseTurnConfig={handleReuseTurnConfig}
+                onRegenerateTurn={handleRegenerateTurn}
+                onRetryImage={handleRetryImage}
+                onTimeoutRetryContinue={handleTimeoutRetryContinue}
+                onDismissErrors={handleDismissErrors}
+                formatConversationTime={formatConversationTime}
+              />
+            </div>
+
+            <button
+              ref={scrollToLatestBtnRef}
+              type="button"
+              aria-label="滚动到最新消息"
+              title="滚动到最新消息"
+              onClick={() => scrollResultsToLatest("smooth")}
+              className="absolute bottom-4 left-1/2 z-20 inline-flex size-11 -translate-x-1/2 items-center justify-center rounded-full border border-stone-200 bg-white/95 text-stone-700 shadow-lg shadow-stone-200/60 backdrop-blur transition hover:-translate-y-0.5 hover:bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-stone-400 dark:border-white/10 dark:bg-stone-800/95 dark:text-stone-100 dark:shadow-black/40 dark:hover:bg-stone-700"
+              style={{ display: "none" }}
+            >
+              <ArrowDown className="size-5" />
+            </button>
+          </div>
+
+          <ImageComposer
+            prompt={imagePrompt}
+            imageCount={imageCount}
+            imageRatio={imageRatio}
+            imageTier={imageTier}
+            imageWidth={imageWidth}
+            imageHeight={imageHeight}
+            imageQuality={imageQuality}
+            imageModel={imageModel}
+            imageModels={imageModels}
+            availableQuota={availableQuota}
+            activeTaskCount={activeTaskCount}
+            referenceImages={referenceImages}
+            maskImages={maskImages}
+            textareaRef={textareaRef}
+            fileInputRef={fileInputRef}
+            onPromptChange={setImagePrompt}
+            onImageCountChange={(value) => setImageCount(value ? clampImageCount(value) : "")}
+            onImageRatioChange={setImageRatio}
+            onImageTierChange={setImageTier}
+            onImageWidthChange={setImageWidth}
+            onImageHeightChange={setImageHeight}
+            onImageQualityChange={setImageQuality}
+            onImageModelChange={(model) => void handleConversationModelChange(model)}
+            onSubmit={handleSubmit}
+            onPickReferenceImage={() => fileInputRef.current?.click()}
+            onReferenceImageChange={handleReferenceImageChange}
+            onRemoveReferenceImage={handleRemoveReferenceImage}
+            onOpenSketch={() => setDrawingDialog({ mode: "sketch" })}
+            retry={retrySettings}
+            globalRetryPercent={globalRetryPercent}
+            onRetryChange={handleRetryChange}
+            referenceMode={referenceMode}
+            pairReferences={pairReferences}
+            onPairReferencesChange={setPairReferences}
+            onToggleReferenceContext={(index) =>
+              setReferenceImages((current) => current.map((image, i) => (i === index ? { ...image, context: !image.context } : image)))
+            }
+            onReferenceModeChange={handleReferenceModeChange}
+            gridRows={gridRows}
+            gridCols={gridCols}
+            gridCells={gridCells}
+            onGridCellsChange={setGridCells}
+            onGridRowsChange={setGridRows}
+            onGridColsChange={setGridCols}
+            onDetectGrid={() => void handleDetectGrid()}
+            preselectFaces={preselectFaces}
+            onPreselectFacesChange={handlePreselectFacesChange}
+            isFindingFaces={isFindingFaces}
+            onStartGrid={() => {
+              handleReferenceModeChange("grid");
+              if (referenceImages.length === 0) {
+                fileInputRef.current?.click();
+              }
+            }}
+            onLoadReferenceSet={(set) => {
+              // 参考集 with photos already there: in grid mode it joins the screenshot as reference photos;
+              // otherwise it's added as 参考 (context) for 逐张参考, sent along with each photo already there.
+              // With no photos yet, the set itself becomes the photos.
+              const grid = referenceMode === "grid";
+              const plain = set.map((image) => ({ name: image.name, type: image.type, dataUrl: image.dataUrl }));
+              const images =
+                referenceImages.length === 0
+                  ? plain
+                  : grid
+                    ? [referenceImages[0], ...plain]
+                    : [...referenceImages, ...plain.map((image) => ({ ...image, context: true }))];
+              setReferenceImages(images);
+              setReferenceImageFiles(images.map((image) => dataUrlToFile(image.dataUrl, image.name, image.type)));
+              setMaskImages([]);
+              setMaskFiles([]);
+              if (!grid && images.length >= 2) {
+                setReferenceMode("perReference");
+              }
+              toast.success(
+                grid && referenceImages.length > 0
+                  ? `已载入 ${set.length} 张参考照片，会随每一格一起发送`
+                  : referenceImages.length > 0
+                    ? `已加入 ${set.length} 张参考，会随每张主图一起发送`
+                    : `已载入 ${images.length} 张参考图`,
+              );
+            }}
+            isDetectingGrid={isDetectingGrid}
+          />
+        </div>
+      </section>
+
+      <ImageLightbox
+        images={lightboxImages}
+        currentIndex={lightboxIndex}
+        open={lightboxOpen}
+        onOpenChange={setLightboxOpen}
+        onIndexChange={setLightboxIndex}
+      />
+
+      <ImageDrawingDialog
+        mode={drawingDialog?.mode || "sketch"}
+        open={drawingDialog !== null}
+        source={drawingDialog?.mode === "annotate" ? drawingDialog.source : undefined}
+        onOpenChange={(open) => {
+          if (!open) setDrawingDialog(null);
+        }}
+        onApply={handleApplyDrawing}
+      />
+
+      {deleteConfirm ? (
+        <Dialog open onOpenChange={(open) => (!open ? setDeleteConfirm(null) : null)}>
+          <DialogContent showCloseButton={false} className="rounded-2xl p-6">
+            <DialogHeader className="gap-2">
+              <DialogTitle>{deleteConfirmTitle}</DialogTitle>
+              <DialogDescription className="text-sm leading-6">
+                {deleteConfirmDescription}
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setDeleteConfirm(null)}>
+                取消
+              </Button>
+              <Button className="bg-rose-600 text-white hover:bg-rose-700" onClick={() => void handleConfirmDelete()}>
+                确认删除
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      ) : null}
+
+
+    </>
+  );
+}
+
+export default function ImagePage() {
+  const { isCheckingAuth, session } = useAuthGuard();
+
+  if (isCheckingAuth || !session) {
+    return (
+      <div className="flex min-h-[40vh] items-center justify-center">
+        <LoaderCircle className="size-5 animate-spin text-stone-400" />
+      </div>
+    );
+  }
+
+  return <ImagePageContent isAdmin={session.role === "admin"} />;
+}
