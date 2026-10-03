@@ -173,6 +173,12 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(result["data"][0]["url"], "fallback")
         self.assertEqual(self.calls, [("fallback", "gpt-image-2.5")])
 
+    def test_cpa_account_source_keeps_chatgpt_web_pool_primary(self):
+        with mock.patch("services.cpa_service.cpa_account_source_enabled", return_value=True):
+            result = providers.route("generate", {"model": "gpt-image-2.5-sunburst"}, self.pool)
+        self.assertEqual(result["data"][0]["url"], CHATGPT_POOL)
+        self.assertEqual([c[0] for c in self.calls], [CHATGPT_POOL])
+
     def test_falls_through_to_next_provider_then_pool(self):
         self.outcomes = {"fallback": RuntimeError("HTTP 403 Insufficient account balance"),
                          "async-example": RuntimeError("非常抱歉，该提示可能违反了我们的内容政策")}

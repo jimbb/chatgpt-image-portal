@@ -245,7 +245,15 @@ def route(mode: str, payload: dict[str, Any], pool_handler: Handler) -> Any:
     model = str(payload.get("model") or config.default_image_model)
     providers = {p["id"]: p for p in list_providers()}
     failures: list[Exception] = []
-    for pid in ranking():
+    provider_order = ranking()
+    # CPA supplies ChatGPT accounts; keep the original web-chat image path as
+    # the primary route instead of silently spending requests at an external
+    # provider that happens to be ranked first.
+    if chatgpt_pool_enabled() and is_supported_image_model(model):
+        from services.cpa_service import cpa_account_source_enabled
+        if cpa_account_source_enabled():
+            provider_order = [CHATGPT_POOL, *[pid for pid in provider_order if pid != CHATGPT_POOL]]
+    for pid in provider_order:
         if pid == CHATGPT_POOL:
             if not chatgpt_pool_enabled() or not is_supported_image_model(model):
                 continue

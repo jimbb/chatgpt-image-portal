@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.9.4 - 2026-10-03
+
++ [修复] CPA account-source mode now keeps the ChatGPT web image pool as the primary route for supported image models, with external OpenAI-compatible providers retained as fallback.
++ [测试] Added regression coverage proving CPA-enabled routing does not silently send normal web image requests to an external provider first.
+
 ## Unreleased
 
 ### Fork snapshot — 2026-10-03
